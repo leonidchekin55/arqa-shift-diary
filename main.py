@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from datetime import date, datetime
+import threading
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -11,6 +13,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 
 DATA_FILE = Path(os.getenv("TRIPS_FILE", Path(__file__).with_name("trips.json")))
+DATA_LOCK = threading.Lock()
 app = FastAPI(title="Дневник смен", version="1.0.0")
 
 
@@ -24,6 +27,8 @@ class TripIn(BaseModel):
 
     @model_validator(mode="after")
     def valid_interval(self):
+        if (self.start.tzinfo is None) != (self.end.tzinfo is None):
+            raise ValueError("Укажите часовой пояс для обоих времён или ни для одного")
         if self.end <= self.start:
             raise ValueError("Время окончания должно быть позже начала")
         return self
@@ -41,7 +46,28 @@ def write_trips(trips: list[dict]) -> None:
 
 
 def trip_day(trip: dict) -> date:
+    """Return the driver's local calendar day from the timestamp's own offset."""
     return datetime.fromisoformat(trip["start"]).date()
+
+
+def public_trip(trip: dict) -> dict:
+    return {key: value for key, value in trip.items() if key != "fingerprint"}
+
+
+def canonical_trip_time(value: datetime) -> str:
+    """Serialize without losing fractional seconds or the driver's UTC offset."""
+    return value.isoformat()
+
+
+def trip_fingerprint(trip: dict) -> str:
+    data = {key: trip[key] for key in ("start", "end", "amount", "payment", "commission")}
+    for key in ("start", "end"):
+        value = datetime.fromisoformat(data[key])
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        data[key] = value.isoformat()
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
 def summarize(trips: list[dict]) -> dict:
@@ -62,7 +88,7 @@ def days():
 
 @app.get("/api/trips")
 def trips_for_day(day: date = Query(...)):
-    return [t for t in read_trips() if trip_day(t) == day]
+    return [public_trip(t) for t in read_trips() if trip_day(t) == day]
 
 
 @app.get("/api/summary")
@@ -75,18 +101,31 @@ def summary_for_day(day: date = Query(...)):
 def add_trip(payload: TripIn):
     trips = read_trips()
     candidate = payload.model_dump(mode="json")
-    # Stable key from canonical payload makes identical network retries idempotent.
-    import hashlib
-    canonical = json.dumps({k: v for k, v in candidate.items() if k != "id"}, sort_keys=True)
-    candidate["id"] = payload.id or "trip-" + hashlib.sha256(canonical.encode()).hexdigest()[:24]
-    for old in trips:
-        if old["id"] == candidate["id"]:
-            if {k: v for k, v in old.items() if k != "id"} != {k: v for k, v in candidate.items() if k != "id"}:
-                raise HTTPException(409, "Этот id уже использован для другой поездки")
-            return {"trip": old, "duplicate": True}
-    trips.append(candidate)
-    write_trips(trips)
-    return {"trip": candidate, "duplicate": False}
+    candidate["start"] = canonical_trip_time(payload.start)
+    candidate["end"] = canonical_trip_time(payload.end)
+    fingerprint = trip_fingerprint(candidate)
+    candidate["id"] = payload.id or "trip-" + fingerprint
+
+    # Serialize read-check-write so concurrent retries cannot both append.
+    with DATA_LOCK:
+        trips = read_trips()
+        for old in trips:
+            same_id = old.get("id") == candidate["id"]
+            same_trip = False
+            if payload.id is None:
+                same_trip = old.get("fingerprint") == fingerprint
+                if not same_trip and all(key in old for key in ("start", "end", "amount", "payment", "commission")):
+                    same_trip = trip_fingerprint(old) == fingerprint
+            if same_id or (payload.id is None and same_trip):
+                old_data = {k: v for k, v in old.items() if k not in {"id", "fingerprint"}}
+                new_data = {k: v for k, v in candidate.items() if k != "id"}
+                if payload.id is not None and same_id and old_data != new_data:
+                    raise HTTPException(409, "Этот id уже использован для другой поездки")
+                return {"trip": public_trip(old), "duplicate": True}
+        candidate["fingerprint"] = fingerprint
+        trips.append(candidate)
+        write_trips(trips)
+    return {"trip": public_trip(candidate), "duplicate": False}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -105,6 +144,45 @@ HTML = r'''<!doctype html>
 <section class="panel add"><h2>Добавить поездку</h2><form id="form" class="form"><input id="start" type="datetime-local" required aria-label="Начало"><input id="end" type="datetime-local" required aria-label="Окончание"><input id="amount" type="number" min="1" placeholder="Сумма, ₸" required><select id="payment"><option value="cash">Наличные</option><option value="card">Карта</option></select><input id="commission" type="number" min="0" placeholder="Комиссия, ₸" required><button>Сохранить</button></form><div id="notice" class="notice"></div></section></main>
 <script>
 const fmt=n=>new Intl.NumberFormat('ru-RU').format(n)+' ₸';const day=document.querySelector('#day');
-async function load(){let days=await fetch('/api/days').then(r=>r.json());if(!days.length)days=[new Date().toISOString().slice(0,10)];let old=day.value;day.innerHTML=days.map(d=>`<option>${d}</option>`).join('');if(days.includes(old))day.value=old;let d=day.value;let [s,ts]=await Promise.all([fetch('/api/summary?day='+d).then(r=>r.json()),fetch('/api/trips?day='+d).then(r=>r.json())]);document.querySelector('#cards').innerHTML=`<div class="card"><div class="label">Поездок</div><div class="value">${s.trip_count}</div></div><div class="card"><div class="label">Выручка</div><div class="value">${fmt(s.revenue)}</div></div><div class="card"><div class="label">Комиссия</div><div class="value">−${fmt(s.commission)}</div></div><div class="card"><div class="label">Наличные / карта</div><div class="value" style="font-size:18px">${fmt(s.cash)} / ${fmt(s.card)}</div></div><div class="card take"><div class="label">На руки</div><div class="value">${fmt(s.take_home)}</div></div>`;document.querySelector('#count').textContent=ts.length+' поездки';document.querySelector('#rows').innerHTML=ts.length?ts.map(t=>`<article class="row"><div><strong>${t.start.slice(11,16)}–${t.end.slice(11,16)}</strong><div class="muted">${t.payment==='cash'?'Наличные':'Карта'} · комиссия ${fmt(t.commission)}</div></div><div class="money">${fmt(t.amount)}</div></article>`).join(''):'<div class="muted">За этот день поездок пока нет</div>'}
-day.onchange=load;document.querySelector('#form').onsubmit=async e=>{e.preventDefault();let local=x=>new Date(x).toISOString();let body={start:local(start.value),end:local(end.value),amount:+amount.value,payment:payment.value,commission:+commission.value};let r=await fetch('/api/trips',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let n=document.querySelector('#notice');if(!r.ok){let j=await r.json();n.textContent=j.detail?.[0]?.msg||j.detail||'Проверьте данные';return}n.textContent='Поездка сохранена';e.target.reset();await load()};load();
+const startInput=document.querySelector('#start'),endInput=document.querySelector('#end');
+const amountInput=document.querySelector('#amount'),paymentInput=document.querySelector('#payment'),commissionInput=document.querySelector('#commission');
+async function load(){
+  const notice=document.querySelector('#notice');
+  try {
+    let days=await fetch('/api/days').then(r=>r.json());
+    if(!days.length){const now=new Date();days=[new Date(now.getTime()-now.getTimezoneOffset()*60000).toISOString().slice(0,10)];}
+    let old=day.value;
+    day.innerHTML=days.map(d=>`<option value="${d}">${d}</option>`).join('');
+    if(days.includes(old))day.value=old;
+    let d=day.value;
+    let [s,ts]=await Promise.all([
+      fetch('/api/summary?day='+encodeURIComponent(d)).then(r=>r.json()),
+      fetch('/api/trips?day='+encodeURIComponent(d)).then(r=>r.json())
+    ]);
+    document.querySelector('#cards').innerHTML=`<div class="card"><div class="label">Поездок</div><div class="value">${s.trip_count}</div></div><div class="card"><div class="label">Выручка</div><div class="value">${fmt(s.revenue)}</div></div><div class="card"><div class="label">Комиссия</div><div class="value">−${fmt(s.commission)}</div></div><div class="card"><div class="label">Наличные / карта</div><div class="value" style="font-size:18px">${fmt(s.cash)} / ${fmt(s.card)}</div></div><div class="card take"><div class="label">На руки</div><div class="value">${fmt(s.take_home)}</div></div>`;
+    document.querySelector('#count').textContent=ts.length+' поездок';
+    document.querySelector('#rows').innerHTML=ts.length?ts.map(t=>`<article class="row"><div><strong>${t.start.slice(11,16)}–${t.end.slice(11,16)}</strong><div class="muted">${t.payment==='cash'?'Наличные':'Карта'} · комиссия ${fmt(t.commission)}</div></div><div class="money">${fmt(t.amount)}</div></article>`).join(''):'<div class="muted">За этот день поездок пока нет</div>';
+    notice.textContent='';
+  } catch(error) {
+    notice.textContent='Не удалось загрузить данные. Проверьте соединение и обновите страницу.';
+  }
+}
+day.onchange=load;
+document.querySelector('#form').onsubmit=async e=>{
+  e.preventDefault();
+  const body={start:startInput.value+':00',end:endInput.value+':00',amount:+amountInput.value,payment:paymentInput.value,commission:+commissionInput.value};
+  const notice=document.querySelector('#notice');
+  try {
+    const r=await fetch('/api/trips',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const result=await r.json();
+    if(!r.ok){notice.textContent=Array.isArray(result.detail)?result.detail.map(x=>x.msg).join(', '):result.detail||'Проверьте данные';return;}
+    notice.textContent=result.duplicate?'Такая поездка уже добавлена':'Поездка сохранена';
+    e.target.reset();
+    day.value=result.trip.start.slice(0,10);
+    await load();
+  } catch(error) {
+    notice.textContent='Не удалось сохранить поездку. Проверьте соединение и отправьте форму ещё раз.';
+  }
+};
+load();
 </script></html>'''
